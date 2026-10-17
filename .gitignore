@@ -22,6 +22,7 @@ click_screenshots/
 test_scripts/
 screenshots/
 thread_dumps.txt
+*.pid
 .claude/
 CLAUDE.md
 # C extensions
