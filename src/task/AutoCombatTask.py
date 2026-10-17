@@ -48,7 +48,8 @@ class AutoCombatTask(BaseCombatTask, TriggerTask):
     def run(self):
         self.warm_up_char_features()
         ret = False
-        if not self.scene.in_team(self.in_team_and_world):
+        # 手柄 UI 下 in_team() 识别不到队伍槽位数字, 先促成一回热切换再走原有键鼠流程
+        if not self.scene.in_team(self.in_team_and_world) and not self.ensure_keyboard_ui():
             return ret
         self.use_liberation = self.config.get('Use Liberation')
         if not self.use_liberation and not self.in_world():  # 仅大世界生效

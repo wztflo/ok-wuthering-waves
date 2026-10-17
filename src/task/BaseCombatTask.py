@@ -53,6 +53,14 @@ class BaseCombatTask(CombatCheck):
     hot_key_verified = False  # 热键是否已验证
     con_full_size = None  # 不同角色协奏值充满时的大小记录
     freeze_durations = []  # 记录冻结/卡肉的持续时间
+    GAMEPAD_KEY_GLYPHS = ('q', 'r', 'e')  # 键鼠 UI 下技能图标旁的按键字形
+    GAMEPAD_PRIME_OFFSET = 16  # 试探用的光标偏移, 保证产生非零位移
+    GAMEPAD_TAKEOVER_ATTEMPT_WINDOW = 0.3  # 每次试探后等待切回键鼠 UI 的时间
+    GAMEPAD_TAKEOVER_TIMEOUT = 2.0  # 单轮手柄 UI 接管的超时时间
+    GAMEPAD_TAKEOVER_FAIL_COOLDOWN = 3.0  # 接管失败后的重试冷却
+    GAMEPAD_TAKEOVER_MAX_FAILS = 3  # 连续失败次数, 达到后进入长冷却
+    GAMEPAD_TAKEOVER_FAIL_BACKOFF = 30.0  # 连续失败后的长冷却
+    GAMEPAD_CLICK_FROM_ATTEMPT = 2  # 第几次试探起改用点击: 实测光标移动不足以触发游戏热切换
     if con_full_size is None:
         con_full_size = Config("_con_full_size", {
             "0": 0,
@@ -81,6 +89,8 @@ class BaseCombatTask(CombatCheck):
         self.use_liberation = True
         # 由副本恢复循环维护: 本轮从信标直接进本时, 退本即回到信标并自动回血
         self.realm_entry_at_heal_point = False
+        self._gamepad_takeover_retry_after = 0.0  # 下次允许尝试手柄 UI 接管的时间戳
+        self._gamepad_takeover_fail_count = 0  # 手柄 UI 连续接管失败次数
 
     def add_freeze_duration(self, start, duration=-1.0, freeze_time=0.1):
         """添加冻结持续时间。用于精确计算技能冷却等。
@@ -332,6 +342,90 @@ class BaseCombatTask(CombatCheck):
         if exception_type is None:
             exception_type = NotInCombatException
         raise exception_type(message)
+
+    def ensure_keyboard_ui(self, time_out=None):
+        """确保当前处于键鼠 UI, 必要时促成一回手柄到键鼠的热切换。
+
+        手柄 UI 下游戏只显示手柄按键图标, 队伍槽位的数字字形不再出现, 因此
+        ``in_team()`` 会失败。此时先发一次会被游戏吞掉的键鼠输入把 UI 切回键鼠,
+        之后所有识别与操作都可以复用原有的键鼠逻辑。
+
+        非战斗状态不发送任何输入, 避免干扰正常游玩。
+
+        Args:
+            time_out (float, optional): 单轮接管的超时时间。默认为 None, 使用类常量。
+
+        Returns:
+            bool: True 表示后续键鼠流程可用。
+        """
+        if self.in_team()[0]:
+            return True
+        if time.time() < self._gamepad_takeover_retry_after:
+            return False
+        if not self.check_health_bar():
+            # 没有敌人血条说明不在战斗, 只可能是在菜单/加载/手柄 UI 走图, 一律不动输入
+            return False
+        if not self.is_gamepad_ui():
+            return False
+        timeout = self.GAMEPAD_TAKEOVER_TIMEOUT if time_out is None else time_out
+        start = time.time()
+        attempts = 0
+        while time.time() - start < timeout:
+            attempts += 1
+            self.prime_keyboard_input(attempts)
+            if self.wait_until(lambda: self.in_team()[0],
+                               time_out=self.GAMEPAD_TAKEOVER_ATTEMPT_WINDOW,
+                               raise_if_not_found=False):
+                self.log_info(f'gamepad ui detected, switched back to keyboard ui in {attempts} attempt(s)')
+                self._gamepad_takeover_fail_count = 0
+                self._gamepad_takeover_retry_after = 0.0
+                return True
+        self._handle_gamepad_takeover_failure(attempts)
+        return False
+
+    def is_gamepad_ui(self):
+        """判断当前画面是否处于手柄 UI。
+
+        手柄 UI 下队伍槽位数字 (``char_*_text``) 与技能图标旁的 ``q``/``r``/``e``
+        字形都会被手柄图标替换; 两类字形同时缺失才判定为手柄 UI, 避免把键鼠 UI
+        误判成手柄 UI 而无谓地发输入。
+
+        Returns:
+            bool: True 表示当前是手柄 UI。
+        """
+        if self.in_team()[0]:
+            return False
+        return not any(self.find_one(name, threshold=0.7) for name in self.GAMEPAD_KEY_GLYPHS)
+
+    def prime_keyboard_input(self, attempt=1):
+        """发送一次用于触发手柄到键鼠热切换的输入。
+
+        实测(2026-10-17)光标移动不足以让游戏热切换, 只有点击这类按键事件才会
+        切换, 且切换用的那次输入会被游戏丢弃。所以第 1 次先用不产生游戏动作的
+        光标移动试探, 之后直接用点击, 既快又不会真的打出一次普攻。
+
+        Args:
+            attempt (int, optional): 当前第几次试探 (从 1 开始)。默认为 1。
+        """
+        if attempt >= self.GAMEPAD_CLICK_FROM_ATTEMPT:
+            self.click()
+            return
+        center_x = self.width_of_screen(0.5)
+        center_y = self.height_of_screen(0.5)
+        self.move(center_x - self.GAMEPAD_PRIME_OFFSET, center_y)
+        self.move(center_x + self.GAMEPAD_PRIME_OFFSET, center_y)
+
+    def _handle_gamepad_takeover_failure(self, attempts):
+        """记录一次接管失败并按连续失败次数退避, 避免高频发输入或刷日志。"""
+        self._gamepad_takeover_fail_count += 1
+        if self._gamepad_takeover_fail_count < self.GAMEPAD_TAKEOVER_MAX_FAILS:
+            self._gamepad_takeover_retry_after = time.time() + self.GAMEPAD_TAKEOVER_FAIL_COOLDOWN
+            logger.debug(f'gamepad ui takeover failed after {attempts} attempt(s), retry later')
+            return
+        self._gamepad_takeover_fail_count = 0
+        self._gamepad_takeover_retry_after = time.time() + self.GAMEPAD_TAKEOVER_FAIL_BACKOFF
+        self.log_warning('gamepad ui takeover failed repeatedly, keep using the controller, retry in '
+                         f'{int(self.GAMEPAD_TAKEOVER_FAIL_BACKOFF)}s')
 
     def wait_combat(self, target=True, time_out=10, raise_if_not_found=True):
         start = time.time()
