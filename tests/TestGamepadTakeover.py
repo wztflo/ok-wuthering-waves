@@ -2,6 +2,7 @@ import ast
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from src.task.AutoCombatTask import AutoCombatTask
 
@@ -110,20 +111,52 @@ class TestAutoCombatGamepadWiring(unittest.TestCase):
         module = ast.parse(Path('src/task/AutoCombatTask.py').read_text(encoding='utf-8'))
         task_class = next(node for node in module.body
                           if isinstance(node, ast.ClassDef) and node.name == 'AutoCombatTask')
-        run = next(node for node in task_class.body
-                   if isinstance(node, ast.FunctionDef) and node.name == 'run')
+        run_auto_combat = next(node for node in task_class.body
+                               if isinstance(node, ast.FunctionDef) and node.name == 'run_auto_combat')
 
-        takeover_calls = [node for node in ast.walk(run)
+        takeover_calls = [node for node in ast.walk(run_auto_combat)
                           if isinstance(node, ast.Call)
                           and isinstance(node.func, ast.Attribute)
                           and node.func.attr == 'ensure_keyboard_ui']
-        combat_loop = [node for node in ast.walk(run)
+        combat_loop = [node for node in ast.walk(run_auto_combat)
                        if isinstance(node, ast.While)
                        and 'in_combat' in ast.unparse(node.test)]
 
-        self.assertTrue(takeover_calls, 'AutoCombatTask.run must call ensure_keyboard_ui')
-        self.assertTrue(combat_loop, 'AutoCombatTask.run must keep the in_combat loop')
+        self.assertTrue(takeover_calls, 'AutoCombatTask.run_auto_combat must call ensure_keyboard_ui')
+        self.assertTrue(combat_loop, 'AutoCombatTask.run_auto_combat must keep the in_combat loop')
         self.assertLess(takeover_calls[0].lineno, combat_loop[0].lineno)
+
+
+class TestAutoCombatGamepadIntegration(unittest.TestCase):
+    """接管失败时必须保留上游 "不在队伍/世界就重置状态" 的行为。"""
+
+    def make_task(self, takeover_result):
+        task = AutoCombatTask.__new__(AutoCombatTask)
+        task.scene = Mock()
+        task.scene.in_team = Mock(return_value=False)
+        task.in_team_and_world = Mock(return_value=True)
+        task.warm_up_char_features = Mock()
+        task.ensure_keyboard_ui = Mock(return_value=takeover_result)
+        task.reset_auto_combat = Mock()
+        task.in_world = Mock(return_value=True)
+        task.in_combat = Mock(return_value=False)
+        task.config = {'Use Liberation': True}
+        return task
+
+    def test_takeover_failure_resets_stale_combat_state(self):
+        task = self.make_task(takeover_result=False)
+
+        self.assertFalse(task.run_auto_combat())
+        task.ensure_keyboard_ui.assert_called_once_with()
+        task.reset_auto_combat.assert_called_once_with('not in team and world')
+        task.in_combat.assert_not_called()
+
+    def test_takeover_success_keeps_combat_state(self):
+        task = self.make_task(takeover_result=True)
+
+        self.assertFalse(task.run_auto_combat())
+        task.ensure_keyboard_ui.assert_called_once_with()
+        task.reset_auto_combat.assert_not_called()
 
 
 if __name__ == '__main__':
